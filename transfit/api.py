@@ -147,6 +147,7 @@ def _context_from_fit_inputs(
     mag_system: Literal["ab", "vega"],
     extinction: Optional[Dict[str, Any] | ExtinctionSpec],
     require_filters: bool,
+    used_bands: Optional[Sequence[str]] = None,
 ) -> _Context:
     """
     Build the internal Context used by fitting.
@@ -154,21 +155,25 @@ def _context_from_fit_inputs(
     Public fitting APIs accept direct scalar inputs instead of exposing
     Context/Distance as required user-facing concepts.
     """
-    if require_filters and filters is None:
-        raise ValueError(
-            "filters is required for multiband fitting."
-        )
     y_kind_n, mag_system_n = validate_observation_mode(y_kind, mag_system)
+    if require_filters:
+        filter_map = normalize_filters(
+            filters,
+            used_bands=used_bands,
+            mag_system=_effective_mag_system(y_kind_n, mag_system_n),
+        )
+    else:
+        filter_map = None if filters is None else normalize_filters(
+            filters,
+            mag_system=_effective_mag_system(y_kind_n, mag_system_n),
+        )
     return _Context(
         distance=_distance_from_public_inputs(
             z=z,
             distance_modulus=distance_modulus,
             require_distance=require_filters,
         ),
-        filters=None if filters is None else normalize_filters(
-            filters,
-            mag_system=_effective_mag_system(y_kind_n, mag_system_n),
-        ),
+        filters=filter_map,
         y_kind=y_kind_n,
         mag_system=mag_system_n,
         extinction=normalize_extinction(extinction),
@@ -185,6 +190,7 @@ def _context_from_forward_inputs(
     extinction: Optional[Dict[str, Any] | ExtinctionSpec],
     require_filters: bool,
     require_distance: bool,
+    used_bands: Optional[Sequence[str]] = None,
 ) -> _Context:
     """
     Build internal forward metadata for public prediction/lightcurve helpers.
@@ -192,19 +198,25 @@ def _context_from_forward_inputs(
     Public forward APIs accept direct scalar inputs instead of requiring
     Context/Distance objects from users.
     """
-    if require_filters and filters is None:
-        raise ValueError("filters is required for multiband forward calculations.")
     y_kind_n, mag_system_n = validate_observation_mode(y_kind, mag_system)
+    if require_filters:
+        filter_map = normalize_filters(
+            filters,
+            used_bands=used_bands,
+            mag_system=_effective_mag_system(y_kind_n, mag_system_n),
+        )
+    else:
+        filter_map = None if filters is None else normalize_filters(
+            filters,
+            mag_system=_effective_mag_system(y_kind_n, mag_system_n),
+        )
     return _Context(
         distance=_distance_from_public_inputs(
             z=z,
             distance_modulus=distance_modulus,
             require_distance=require_distance,
         ),
-        filters=None if filters is None else normalize_filters(
-            filters,
-            mag_system=_effective_mag_system(y_kind_n, mag_system_n),
-        ),
+        filters=filter_map,
         y_kind=y_kind_n,
         mag_system=mag_system_n,
         extinction=normalize_extinction(extinction),
@@ -1012,10 +1024,15 @@ def lightcurve_multiband(
     """
     Return a multi-band light curve on an observer-frame time grid.
 
+    ``filters`` may be omitted if every entry in ``bands`` is itself a
+    registered built-in filter_id (for example, ``"sdss.u"``). Explicit
+    mappings are still required for aliases and custom filters.
+
     User-facing time arguments are observer-frame days.
     Internal model evolution is solved in rest-frame time.
     """
     model = canonical_model_name(model, warn_legacy=True)
+    bands = [normalize_band_label(b) for b in list(bands)]
     ctx = _context_from_forward_inputs(
         z=z,
         distance_modulus=distance_modulus,
@@ -1025,9 +1042,9 @@ def lightcurve_multiband(
         extinction=extinction,
         require_filters=True,
         require_distance=True,
+        used_bands=bands,
     )
     sed = sed or BlackbodySED()
-    bands = [normalize_band_label(b) for b in list(bands)]
     filter_map = validate_filter_map(
         ctx.filters or {},
         used_bands=bands,
@@ -1099,10 +1116,21 @@ def predict_multiband(
     """
     Predict multi-band observables at observer-frame times `t_days`.
 
+    ``filters`` may be omitted if every entry in ``band`` is itself a
+    registered built-in filter_id. Explicit mappings are still required for
+    aliases and custom filters.
+
     `t_days` and `t_max_days` are interpreted in observer-frame days.
     Internal model evolution is solved in rest-frame time.
     """
     model = canonical_model_name(model, warn_legacy=True)
+    t_days = np.asarray(t_days, float).reshape(-1)
+
+    # Keep band case; only strip whitespace.
+    band = np.asarray([normalize_band_label(b) for b in np.asarray(band).reshape(-1)], dtype=object)
+    _check_same_length(t_days=t_days, band=band)
+
+    uniq = sorted(set(band.tolist()))
     ctx = _context_from_forward_inputs(
         z=z,
         distance_modulus=distance_modulus,
@@ -1112,15 +1140,9 @@ def predict_multiband(
         extinction=extinction,
         require_filters=True,
         require_distance=True,
+        used_bands=uniq,
     )
     sed = sed or BlackbodySED()
-    t_days = np.asarray(t_days, float).reshape(-1)
-
-    # Keep band case; only strip whitespace.
-    band = np.asarray([normalize_band_label(b) for b in np.asarray(band).reshape(-1)], dtype=object)
-    _check_same_length(t_days=t_days, band=band)
-
-    uniq = sorted(set(band.tolist()))
     filter_map = validate_filter_map(
         ctx.filters or {},
         used_bands=uniq,
@@ -2019,7 +2041,18 @@ def fit_multiband(
     sampler_kwargs: Optional[Dict[str, Any]] = None,
     model_kwargs: Optional[Dict[str, Any]] = None,
 ) -> FitResult:
+    """Fit multi-band data.
+
+    If a data band label is already a registered built-in filter_id, its
+    filter definition is resolved automatically. ``filters`` only needs to
+    define aliases and custom filters.
+    """
     model = canonical_model_name(model, warn_legacy=True)
+    data = _apply_data_filter(data)
+    band = np.asarray(
+        [normalize_band_label(b) for b in np.asarray(data.band).reshape(-1)],
+        dtype=object,
+    )
     ctx = _context_from_fit_inputs(
         z=z,
         distance_modulus=distance_modulus,
@@ -2028,6 +2061,7 @@ def fit_multiband(
         mag_system=mag_system,
         extinction=extinction,
         require_filters=True,
+        used_bands=sorted(set(band.tolist())),
     )
     sampler_kwargs = dict(sampler_kwargs or {})
     model_kwargs = dict(model_kwargs or {})
@@ -2048,15 +2082,10 @@ def fit_multiband(
         priors=priors,
         model_kwargs=model_kwargs_pred,
     )
-    data = _apply_data_filter(data)
-
     # ---- data ----
     t_obs = _as_1d_float(data.t_days, "data.t_days")
     y_obs = _as_1d_float(data.y, "data.y")
     y_err = _as_1d_float(data.yerr, "data.yerr")
-
-    # Keep band case; only strip whitespace.
-    band = np.asarray([normalize_band_label(b) for b in np.asarray(data.band).reshape(-1)], dtype=object)
 
     _check_same_length(t_days=t_obs, band=band, y=y_obs, yerr=y_err)
 
